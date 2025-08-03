@@ -16,43 +16,27 @@ package org.datanucleus.store.neo4j.fieldmanager;
 
 import org.datanucleus.ExecutionContext;
 import org.datanucleus.PersistableObjectType;
+import org.datanucleus.exceptions.NucleusDataStoreException;
 import org.datanucleus.identity.IdentityUtils;
 import org.datanucleus.metadata.AbstractMemberMetaData;
 import org.datanucleus.state.DNStateManager;
+import org.datanucleus.store.neo4j.Neo4jStoreManager;
 import org.neo4j.driver.Transaction;
-import org.neo4j.driver.types.Node; // <-- REQUIRED IMPORT
-
+import org.neo4j.driver.types.Node;
+import java.util.Collection;
 import java.util.HashMap;
 import java.util.Map;
-import java.util.Collection;
 
 public class BoltRelationshipManager {
 
     private final Transaction tx;
-    private final DNStateManager sm;
-    private final Node node; // <-- REQUIRED FIELD
+    private final DNStateManager ownerSM;
+    private final Node ownerNode;
 
-    /**
-     * Constructor for when the owner Node is already known (updates, deletes, and relation handling after insert).
-     * @param sm The StateManager of the owner object.
-     * @param tx The active transaction.
-     * @param node The Neo4j Node representing the owner object.
-     */
     public BoltRelationshipManager(DNStateManager sm, Transaction tx, Node node) {
-        this.sm = sm;
+        this.ownerSM = sm;
         this.tx = tx;
-        this.node = node;
-    }
-
-    /**
-     * Constructor for the initial insert path before the owner Node is created.
-     * @param sm The StateManager of the owner object.
-     * @param tx The active transaction.
-     */
-    public BoltRelationshipManager(DNStateManager sm, Transaction tx) {
-        this.sm = sm;
-        this.tx = tx;
-        this.node = null; // The node is not yet created in this path.
+        this.ownerNode = node;
     }
 
     public void storeRelationField(AbstractMemberMetaData mmd, Object relatedObject) {
@@ -69,36 +53,45 @@ public class BoltRelationshipManager {
     }
 
     private void createRelationship(AbstractMemberMetaData mmd, Object relatedObject) {
-        System.out.println("Relationship created!! ");
-        ExecutionContext ec = sm.getExecutionContext();
+        ExecutionContext ec = ownerSM.getExecutionContext();
         DNStateManager relatedSM = ec.findStateManager(relatedObject);
+
+        if (relatedSM == null || relatedSM.getLifecycleState().isNew()) {
+            ec.persistObjectInternal(relatedObject, null, PersistableObjectType.PC, ownerSM, mmd.getAbsoluteFieldNumber());
+            relatedSM = ec.findStateManager(relatedObject);
+        }
+
         if (relatedSM == null) {
-            // Persist the related object if it's new
-            relatedSM = ec.findStateManager(ec.persistObjectInternal(relatedObject, null, PersistableObjectType.PC, sm, mmd.getAbsoluteFieldNumber()));
+            throw new NucleusDataStoreException("Failed to find StateManager for related object: " + relatedObject);
+        }
+
+        // === THE DEFINITIVE FIX: Retrieve the Node directly from the cache ===
+        Node relatedNode = (Node) relatedSM.getAssociatedValue(Neo4jStoreManager.OBJECT_PROVIDER_PROPCONTAINER);
+        if (relatedNode == null) {
+            throw new NucleusDataStoreException("Could not find cached Node for related object: " + relatedSM.getObjectAsPrintable() +
+                ". This indicates a failure in the persistence lifecycle.");
         }
         
-        // At this point, both owner and related objects are managed and have valid IDs.
-        Object ownerIdVal = IdentityUtils.getTargetKeyForDatastoreIdentity(sm.getInternalObjectId());
-        Object relatedIdVal = IdentityUtils.getTargetKeyForDatastoreIdentity(relatedSM.getInternalObjectId());
+        long ownerIdVal = this.ownerNode.id();
+        long relatedIdVal = relatedNode.id();
 
-        String ownerLabel = sm.getClassMetaData().getName();
-        String relatedLabel = relatedSM.getClassMetaData().getName();
         String relType = mmd.getName().toUpperCase();
-
-        // MERGE is used to prevent creating duplicate relationships
-        String cypher = String.format("MATCH (a:%s), (b:%s) WHERE id(a) = $ownerId AND id(b) = $relatedId MERGE (a)-[:%s]->(b)", 
-            ownerLabel, relatedLabel, relType);
+        String cypher = String.format(
+            "MATCH (a) WHERE id(a) = $ownerId " +
+            "MATCH (b) WHERE id(b) = $relatedId " +
+            "MERGE (a)-[:`%s`]->(b)",
+            relType
+        );
         
         Map<String, Object> params = new HashMap<>();
         params.put("ownerId", ownerIdVal);
         params.put("relatedId", relatedIdVal);
-        tx.run(cypher, params);
+
+        tx.run(cypher, params).consume();
     }
 
     public void deleteRelationField(AbstractMemberMetaData mmd, Object relatedObject) {
-        if (relatedObject == null) {
-            return;
-        }
+        if (relatedObject == null) return;
         if (relatedObject instanceof Collection) {
             for (Object element : (Collection<?>) relatedObject) {
                 deleteRelationship(mmd, element);
@@ -109,21 +102,14 @@ public class BoltRelationshipManager {
     }
 
     private void deleteRelationship(AbstractMemberMetaData mmd, Object relatedObject) {
-        // This method handles cascade-delete for dependent fields.
         if (mmd.isDependent()) {
-            DNStateManager relatedSM = sm.getExecutionContext().findStateManager(relatedObject);
-            if (relatedSM == null || relatedSM.getInternalObjectId() == null) {
-                return;
-            }
-
+            DNStateManager relatedSM = ownerSM.getExecutionContext().findStateManager(relatedObject);
+            if (relatedSM == null || relatedSM.getInternalObjectId() == null) return;
+            
             Object relatedIdVal = IdentityUtils.getTargetKeyForDatastoreIdentity(relatedSM.getInternalObjectId());
-            String relatedLabel = relatedSM.getClassMetaData().getName();
-
-            // DETACH DELETE will remove the node and all of its relationships.
-            String cypherNodeDelete = String.format("MATCH (b:%s) WHERE id(b) = $relatedId DETACH DELETE b", relatedLabel);
+            String cypherNodeDelete = "MATCH (b) WHERE id(b) = $relatedId DETACH DELETE b";
             Map<String, Object> nodeDeleteParams = new HashMap<>();
             nodeDeleteParams.put("relatedId", relatedIdVal);
-
             tx.run(cypherNodeDelete, nodeDeleteParams);
         }
     }

@@ -15,113 +15,116 @@ limitations under the License.
 package org.datanucleus.store.neo4j.fieldmanager;
 
 import java.util.HashMap;
+import java.util.List;
 import java.util.Map;
 import org.datanucleus.ClassLoaderResolver;
+import org.datanucleus.exceptions.NucleusDataStoreException;
 import org.datanucleus.metadata.AbstractMemberMetaData;
 import org.datanucleus.metadata.RelationType;
 import org.datanucleus.state.DNStateManager;
 import org.datanucleus.store.fieldmanager.AbstractStoreFieldManager;
+import org.datanucleus.store.neo4j.Neo4jSchemaUtils;
+import org.datanucleus.store.neo4j.Neo4jStoreManager;
 import org.neo4j.driver.Record;
 import org.neo4j.driver.Result;
 import org.neo4j.driver.Transaction;
+import org.neo4j.driver.Values;
 import org.neo4j.driver.types.Node;
 
 public class BoltFieldManager extends AbstractStoreFieldManager {
 
     private final Transaction tx;
-    private final BoltRelationshipManager relMgr;
+    private final Node node; // Used for deletes/updates
+
     private Map<String, Object> properties;
     private Map<AbstractMemberMetaData, Object> relationFields;
-    private final Node node;
 
     public BoltFieldManager(DNStateManager sm, Transaction tx, boolean insert) {
         super(sm, insert);
         this.tx = tx;
         this.node = null;
-        this.relMgr = new BoltRelationshipManager(sm, tx);
         if (insert) {
             this.properties = new HashMap<>();
             this.relationFields = new HashMap<>();
         }
     }
 
-    /**
-     * New constructor for update/delete/relation operations where the Node is already known.
-     */
     public BoltFieldManager(DNStateManager sm, Transaction tx, boolean insert, Node node) {
         super(sm, insert);
         this.tx = tx;
         this.node = node;
-        // IMPORTANT: Your BoltRelationshipManager class will need a matching constructor for this to work.
-        this.relMgr = new BoltRelationshipManager(sm, tx, node);
-        if (insert) {
-            this.properties = new HashMap<>();
-            this.relationFields = new HashMap<>();
-        }
-    }
-
-    /**
-     * Accessor for the properties map, used during the insert process.
-     */
-    public Map<String, Object> getProperties() {
-        return properties;
     }
 
     @Override
     public void storeObjectField(int fieldNumber, Object value) {
-        if (!isStorable(fieldNumber)) return;
+        if (!isStorable(fieldNumber)) {
+            return;
+        }
         AbstractMemberMetaData mmd = getMMD(fieldNumber);
         ClassLoaderResolver clr = sm.getExecutionContext().getClassLoaderResolver();
         RelationType relationType = mmd.getRelationType(clr);
-        boolean isRelation = (relationType != RelationType.NONE && !mmd.isEmbedded());
 
         if (insert) {
-            if (isRelation) {
-                if (value != null) relationFields.put(mmd, value);
-            } else {
-                if (properties != null) {
-                    properties.put(mmd.getName(), value);
+            if (relationType != RelationType.NONE && !mmd.isEmbedded()) {
+                if (value != null) {
+                    relationFields.put(mmd, value);
                 }
+            } else {
+                properties.put(mmd.getName(), value);
             }
-        } else { // DELETE or UPDATE LOGIC
-            if (isRelation && value != null) {
-                // When deleting, this finds and removes relationships.
-                // When updating, this could be extended to update relationships.
+        } else { // Delete operation
+            if (relationType != RelationType.NONE && !mmd.isEmbedded() && value != null) {
+                BoltRelationshipManager relMgr = new BoltRelationshipManager(sm, tx, this.node);
                 relMgr.deleteRelationField(mmd, value);
-            } else if (!isRelation && node != null) {
-                // Logic for updating a simple property on an existing node
-                // Note: The new BoltPersistenceHandler handles this via a direct Cypher query now.
-                // This path is primarily for relation management.
             }
         }
     }
 
-    @Override public void storeBooleanField(int fn, boolean v) { if(insert && isStorable(fn) && properties != null) properties.put(getMMD(fn).getName(),v); }
-    @Override public void storeCharField(int fn, char v) { if(insert && isStorable(fn) && properties != null) properties.put(getMMD(fn).getName(),String.valueOf(v)); }
-    @Override public void storeByteField(int fn, byte v) { if(insert && isStorable(fn) && properties != null) properties.put(getMMD(fn).getName(),v); }
-    @Override public void storeShortField(int fn, short v) { if(insert && isStorable(fn) && properties != null) properties.put(getMMD(fn).getName(),v); }
-    @Override public void storeIntField(int fn, int v) { if(insert && isStorable(fn) && properties != null) properties.put(getMMD(fn).getName(),v); }
-    @Override public void storeLongField(int fn, long v) { if(insert && isStorable(fn) && properties != null) properties.put(getMMD(fn).getName(),v); }
-    @Override public void storeFloatField(int fn, float v) { if(insert && isStorable(fn) && properties != null) properties.put(getMMD(fn).getName(),v); }
-    @Override public void storeDoubleField(int fn, double v) { if(insert && isStorable(fn) && properties != null) properties.put(getMMD(fn).getName(),v); }
-    @Override public void storeStringField(int fn, String v) { if(insert && isStorable(fn) && properties != null) properties.put(getMMD(fn).getName(),v); }
+    @Override public void storeBooleanField(int fn, boolean v) { if(insert && isStorable(fn)) properties.put(getMMD(fn).getName(),v); }
+    @Override public void storeCharField(int fn, char v) { if(insert && isStorable(fn)) properties.put(getMMD(fn).getName(),String.valueOf(v)); }
+    @Override public void storeByteField(int fn, byte v) { if(insert && isStorable(fn)) properties.put(getMMD(fn).getName(),v); }
+    @Override public void storeShortField(int fn, short v) { if(insert && isStorable(fn)) properties.put(getMMD(fn).getName(),v); }
+    @Override public void storeIntField(int fn, int v) { if(insert && isStorable(fn)) properties.put(getMMD(fn).getName(),v); }
+    @Override public void storeLongField(int fn, long v) { if(insert && isStorable(fn)) properties.put(getMMD(fn).getName(),v); }
+    @Override public void storeFloatField(int fn, float v) { if(insert && isStorable(fn)) properties.put(getMMD(fn).getName(),v); }
+    @Override public void storeDoubleField(int fn, double v) { if(insert && isStorable(fn)) properties.put(getMMD(fn).getName(),v); }
+    @Override public void storeStringField(int fn, String v) { if(insert && isStorable(fn)) properties.put(getMMD(fn).getName(),v); }
 
     public void execute() {
-        if (!insert) return;
-        String label = cmd.getName();
-        String cypher = String.format("CREATE (n:%s $props) RETURN id(n)", label);
-        Result result = tx.run(cypher, Map.of("props", properties));
+        if (!insert) {
+            return;
+        }
+
+        List<String> labelList = Neo4jSchemaUtils.getLabelsForClass(cmd, sm.getExecutionContext().getStoreManager());
+        StringBuilder cypher = new StringBuilder("CREATE (n");
+        labelList.forEach(label -> cypher.append(":").append(Neo4jSchemaUtils.getLabelName(label)));
+        cypher.append(" $props) RETURN n");
+
+        Result result = tx.run(cypher.toString(), Values.parameters("props", properties));
+        Node createdNode;
         if (result.hasNext()) {
             Record record = result.next();
-            long nativeId = record.get(0).asLong();
-            sm.setPostStoreNewObjectId(nativeId);
+            createdNode = record.get(0).asNode();
+            
+            // CRITICAL: Cache the node immediately so recursive calls can find it.
+            sm.setAssociatedValue(Neo4jStoreManager.OBJECT_PROVIDER_PROPCONTAINER, createdNode);
+
+            if (cmd.getIdentityType() == org.datanucleus.metadata.IdentityType.DATASTORE) {
+                sm.setPostStoreNewObjectId(createdNode.id());
+            }
+        } else {
+            throw new NucleusDataStoreException("CREATE query failed to return the created node for: " + sm.getObjectAsPrintable());
         }
+
         if (!relationFields.isEmpty()) {
+            BoltRelationshipManager relMgr = new BoltRelationshipManager(sm, tx, createdNode);
             for (Map.Entry<AbstractMemberMetaData, Object> entry : relationFields.entrySet()) {
                 relMgr.storeRelationField(entry.getKey(), entry.getValue());
             }
         }
     }
     
-    private AbstractMemberMetaData getMMD(int fn) { return cmd.getMetaDataForManagedMemberAtAbsolutePosition(fn); }
+    private AbstractMemberMetaData getMMD(int fn) { 
+        return cmd.getMetaDataForManagedMemberAtAbsolutePosition(fn); 
+    }
 }

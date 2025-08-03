@@ -14,12 +14,18 @@ limitations under the License.
 **********************************************************************/
 package org.datanucleus.store.neo4j;
 
+// Required DataNucleus imports based on your provided interfaces and context
 import org.datanucleus.ExecutionContext;
+import org.datanucleus.PersistenceNucleusContext;
 import org.datanucleus.exceptions.NucleusDataStoreException;
+import org.datanucleus.exceptions.NucleusUserException;
+import org.datanucleus.identity.IdentityManager;
 import org.datanucleus.identity.IdentityUtils;
 import org.datanucleus.metadata.AbstractClassMetaData;
 import org.datanucleus.metadata.IdentityType;
 import org.datanucleus.state.DNStateManager;
+
+// Required Neo4j driver imports
 import org.neo4j.driver.Result;
 import org.neo4j.driver.Transaction;
 import org.neo4j.driver.Values;
@@ -27,11 +33,16 @@ import org.neo4j.driver.types.Node;
 
 /**
  * Utility methods for persistence operations using the Bolt driver.
- * This class encapsulates the logic for retrieving a Neo4j Node,
- * prioritizing the in-transaction cache before querying the database.
  */
 public class BoltPersistenceUtils {
 
+    /**
+     * Retrieves the Neo4j Node for a given StateManager.
+     * It first checks the in-transaction cache on the StateManager and, if not found, queries the database.
+     * @param tx The active Neo4j transaction.
+     * @param sm The StateManager for the object.
+     * @return The corresponding Neo4j Node, or null if not found.
+     */
     public static Node getPropertyContainerForStateManager(Transaction tx, DNStateManager sm) {
         Object associatedValue = sm.getAssociatedValue(Neo4jStoreManager.OBJECT_PROVIDER_PROPCONTAINER);
         if (associatedValue instanceof Node) {
@@ -42,7 +53,7 @@ public class BoltPersistenceUtils {
         if (id == null) {
             return null;
         }
-        
+
         if (sm.getClassMetaData().getIdentityType() == IdentityType.APPLICATION) {
             AbstractClassMetaData cmd = sm.getClassMetaData();
             String[] pkMemberNames = cmd.getPrimaryKeyMemberNames();
@@ -50,7 +61,7 @@ public class BoltPersistenceUtils {
 
             String cypher = String.format("MATCH (n:`%s` {`%s`: $pkValue}) RETURN n", cmd.getName(), pkMemberName);
             Object pkValue = IdentityUtils.getTargetKeyForSingleFieldIdentity(id);
-            
+
             Result result = tx.run(cypher, Values.parameters("pkValue", pkValue));
             return result.hasNext() ? result.single().get("n").asNode() : null;
         }
@@ -66,43 +77,49 @@ public class BoltPersistenceUtils {
 
     /**
      * Finds or creates a managed Java object for a given Neo4j Node.
-     * It constructs the object's identity and asks the ExecutionContext to find it,
-     * creating a hollow object if it's not already managed.
+     * This method TRUSTS that the provided AbstractClassMetaData is the correct one for the Node.
+     * The responsibility for providing the correct metadata lies with the calling query engine.
      * @param ec The ExecutionContext.
      * @param node The Neo4j Node.
-     * @param cmd The metadata for the class of the Java object.
+     * @param cmd The metadata for the class of the Java object (assumed to be correct).
      * @return The managed Java object.
      */
     public static Object getObjectForNode(ExecutionContext ec, Node node, AbstractClassMetaData cmd) {
+        if (cmd == null) {
+            throw new NucleusDataStoreException("Cannot create object for Node. The provided ClassMetaData is null.");
+        }
+
+        // Get the IdentityManager by casting the NucleusContext. This is required for the provided API version.
+        IdentityManager identityMgr = ((PersistenceNucleusContext) ec.getNucleusContext()).getIdentityManager();
+
         Object id;
         if (cmd.getIdentityType() == IdentityType.DATASTORE) {
-            id = ec.getNucleusContext().getIdentityManager().getDatastoreId(cmd.getFullClassName(), node.id());
+            id = identityMgr.getDatastoreId(cmd.getFullClassName(), node.id());
         } 
         else if (cmd.getIdentityType() == IdentityType.APPLICATION)
         {
-            // ============================ THE DEFINITIVE FIX ============================
-            Class pcType = ec.getClassLoaderResolver().classForName(cmd.getFullClassName());
+            Class<?> pcType = ec.getClassLoaderResolver().classForName(cmd.getFullClassName());
             int[] pkMemberPositions = cmd.getPKMemberPositions();
             if (pkMemberPositions.length == 1) {
-                // Handle single-field application identity
                 String pkMemberName = cmd.getMetaDataForManagedMemberAtAbsolutePosition(pkMemberPositions[0]).getName();
+                if (!node.containsKey(pkMemberName)) {
+                     throw new NucleusUserException("Application identity field '" + pkMemberName + "' not found in query results for " + cmd.getName() + ".");
+                }
                 Object pkValue = node.get(pkMemberName).asObject();
-                id = ec.getNucleusContext().getIdentityManager().getApplicationId(pcType, pkValue);
+                if (pkValue == null) {
+                    throw new NucleusUserException("Application identity field '" + pkMemberName + "' is null in the database for " + cmd.getName() + ".");
+                }
+                id = identityMgr.getApplicationId(pcType, pkValue);
             } else {
-                // Handle composite (multi-field) application identity
                 StringBuilder pkStr = new StringBuilder();
                 for (int i = 0; i < pkMemberPositions.length; i++) {
                     String pkMemberName = cmd.getMetaDataForManagedMemberAtAbsolutePosition(pkMemberPositions[i]).getName();
                     Object pkValue = node.get(pkMemberName).asObject();
-                    if (i > 0) {
-                        pkStr.append('_');
-                    }
+                    if (i > 0) pkStr.append('_');
                     pkStr.append(pkValue.toString());
                 }
-                // Use the correct API that takes a Class and a key Object (here, a String representation)
-                id = ec.getNucleusContext().getIdentityManager().getApplicationId(pcType, pkStr.toString());
+                id = identityMgr.getApplicationId(pcType, pkStr.toString());
             }
-            // ========================== END OF THE DEFINITIVE FIX =======================
         }
         else 
         {

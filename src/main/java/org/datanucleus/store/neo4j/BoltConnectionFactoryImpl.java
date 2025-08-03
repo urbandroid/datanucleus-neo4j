@@ -45,7 +45,7 @@ public class BoltConnectionFactoryImpl extends AbstractConnectionFactory {
         String user = storeMgr.getConnectionUserName();
         String password = storeMgr.getConnectionPassword();
 
-        // Fix: strip the "neo4j:" prefix if present (DN usually expects bolt:// or neo4j://)
+        // CRITICAL FIX: The Neo4j driver expects "bolt://" or "neo4j://", not "neo4j:bolt://"
         String driverUrl = url;
         if (url != null && url.toLowerCase().startsWith("neo4j:")) {
             driverUrl = url.substring("neo4j:".length());
@@ -69,7 +69,7 @@ public class BoltConnectionFactoryImpl extends AbstractConnectionFactory {
 
     public class BoltManagedConnection extends AbstractManagedConnection {
         private Session session;
-        private XAResource xaRes;
+        private EmulatedXAResource xaRes;
 
         BoltManagedConnection() {
             this.session = driver.session();
@@ -107,10 +107,7 @@ public class BoltConnectionFactoryImpl extends AbstractConnectionFactory {
 
         @Override
         public void close() {
-            // Close when the PM is really closed.
-            if (session != null && session.isOpen()) {
-                session.close();
-            }
+            release();
             super.close();
         }
     }
@@ -139,7 +136,6 @@ public class BoltConnectionFactoryImpl extends AbstractConnectionFactory {
 
         @Override
         public void commit(Xid xid, boolean onePhase) throws XAException {
-            // Commit the native transaction *before* delegating to the super, since super may release/close.
             try {
                 if (tx != null && tx.isOpen()) {
                     tx.commit();
@@ -150,6 +146,7 @@ public class BoltConnectionFactoryImpl extends AbstractConnectionFactory {
                 throw (XAException) new XAException(XAException.XA_RBROLLBACK).initCause(e);
             } finally {
                 tx = null;
+                super.commit(xid, onePhase); // This is critical, it calls mconn.release()
             }
             super.commit(xid, onePhase);
         }

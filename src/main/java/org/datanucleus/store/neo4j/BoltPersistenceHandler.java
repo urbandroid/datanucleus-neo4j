@@ -14,27 +14,16 @@ limitations under the License.
 **********************************************************************/
 package org.datanucleus.store.neo4j;
 
-import java.util.HashMap;
-import java.util.List;
-import java.util.Map;
 import org.datanucleus.ExecutionContext;
-import org.datanucleus.exceptions.NucleusDataStoreException;
 import org.datanucleus.exceptions.NucleusObjectNotFoundException;
-import org.datanucleus.exceptions.NucleusUserException;
-import org.datanucleus.metadata.AbstractClassMetaData;
 import org.datanucleus.metadata.AbstractMemberMetaData;
-import org.datanucleus.metadata.IdentityType;
 import org.datanucleus.metadata.VersionMetaData;
-import org.datanucleus.metadata.VersionStrategy;
 import org.datanucleus.state.DNStateManager;
 import org.datanucleus.store.AbstractPersistenceHandler;
 import org.datanucleus.store.StoreManager;
 import org.datanucleus.store.connection.ManagedConnection;
-import org.datanucleus.store.neo4j.fieldmanager.BoltFieldManager;
 import org.datanucleus.store.neo4j.fieldmanager.BoltFetchFieldManager;
-import org.datanucleus.util.Localiser;
-import org.datanucleus.util.NucleusLogger;
-import org.neo4j.driver.Result;
+import org.datanucleus.store.neo4j.fieldmanager.BoltFieldManager;
 import org.neo4j.driver.Transaction;
 import org.neo4j.driver.Value;
 import org.neo4j.driver.Values;
@@ -54,66 +43,15 @@ public class BoltPersistenceHandler extends AbstractPersistenceHandler {
         assertReadOnlyForUpdateOfObject(sm);
         ExecutionContext ec = sm.getExecutionContext();
         ManagedConnection mconn = storeMgr.getConnectionManager().getConnection(ec);
-
         try {
             Transaction tx = ((BoltConnectionFactoryImpl.EmulatedXAResource) mconn.getXAResource()).getTransaction();
-            insertObjectAndCacheNode(sm, tx);
-
-            // Now handle relations using the cached Node
-            Node node = (Node) sm.getAssociatedValue(Neo4jStoreManager.OBJECT_PROVIDER_PROPCONTAINER);
-            int[] relPositions = sm.getClassMetaData().getRelationMemberPositions(ec.getClassLoaderResolver());
-            if (relPositions.length > 0) {
-                sm.provideFields(relPositions, new BoltFieldManager(sm, tx, true, node));
-            }
+            
+            BoltFieldManager fieldManager = new BoltFieldManager(sm, tx, true);
+            sm.provideFields(sm.getClassMetaData().getAllMemberPositions(), fieldManager);
+            
+            fieldManager.execute();
         } finally {
             mconn.release();
-        }
-    }
-
-    private void insertObjectAndCacheNode(DNStateManager sm, Transaction tx) {
-        AbstractClassMetaData cmd = sm.getClassMetaData();
-        ExecutionContext ec = sm.getExecutionContext();
-
-        Map<String, Object> props = new HashMap<>();
-        if (cmd.isVersioned()) {
-            VersionMetaData vermd = cmd.getVersionMetaDataForClass();
-            if (vermd.getStrategy() == VersionStrategy.VERSION_NUMBER) {
-                long version = 1L;
-                sm.setTransactionalVersion(version);
-                if (vermd.getMemberName() != null) {
-                    AbstractMemberMetaData verMmd = cmd.getMetaDataForMember(vermd.getMemberName());
-                    sm.replaceField(verMmd.getAbsoluteFieldNumber(), version);
-                } else {
-                    props.put(Neo4jSchemaUtils.getSurrogateVersionName(cmd, storeMgr), version);
-                }
-            }
-        }
-        if (cmd.hasDiscriminatorStrategy()) {
-            props.put(Neo4jSchemaUtils.getSurrogateDiscriminatorName(cmd, storeMgr), cmd.getDiscriminatorValue());
-        }
-
-        BoltFieldManager fm = new BoltFieldManager(sm, tx, true);
-        sm.provideFields(cmd.getNonRelationMemberPositions(ec.getClassLoaderResolver()), fm);
-        props.putAll(fm.getProperties());
-
-        List<String> labelList = Neo4jSchemaUtils.getLabelsForClass(cmd, storeMgr);
-        StringBuilder cypher = new StringBuilder("CREATE (n");
-        labelList.forEach(label -> cypher.append(":").append(Neo4jSchemaUtils.getLabelName(label)));
-        cypher.append(" $props) RETURN n, id(n) as nodeId");
-
-        Result result = tx.run(cypher.toString(), Values.parameters("props", props));
-        if (result.hasNext()) {
-            org.neo4j.driver.Record record = result.next();
-            Node node = record.get("n").asNode();
-            long nodeId = record.get("nodeId").asLong();
-            
-            sm.setAssociatedValue(Neo4jStoreManager.OBJECT_PROVIDER_PROPCONTAINER, node);
-            
-            if (cmd.pkIsDatastoreAttributed(storeMgr)) {
-                sm.setPostStoreNewObjectId(nodeId);
-            }
-        } else {
-            throw new NucleusDataStoreException("CREATE query failed for: " + sm.getObjectAsPrintable());
         }
     }
 
@@ -123,21 +61,20 @@ public class BoltPersistenceHandler extends AbstractPersistenceHandler {
         ManagedConnection mconn = storeMgr.getConnectionManager().getConnection(ec);
         try {
             Transaction tx = ((BoltConnectionFactoryImpl.EmulatedXAResource) mconn.getXAResource()).getTransaction();
-            
             Node node = BoltPersistenceUtils.getPropertyContainerForStateManager(tx, sm);
             if (node == null) {
                 throw new NucleusObjectNotFoundException("Datastore object not found for id: " + sm.getInternalObjectId());
             }
 
             sm.setAssociatedValue(Neo4jStoreManager.OBJECT_PROVIDER_PROPCONTAINER, node);
-            
             sm.replaceFields(fieldNumbers, new BoltFetchFieldManager(sm, tx, node));
 
             if (sm.getClassMetaData().isVersioned() && sm.getTransactionalVersion() == null) {
                 VersionMetaData vermd = sm.getClassMetaData().getVersionMetaDataForClass();
                 Object datastoreVersion = null;
                 if (vermd.getMemberName() != null) {
-                    datastoreVersion = sm.provideField(sm.getClassMetaData().getAbsolutePositionOfMember(vermd.getMemberName()));
+                    AbstractMemberMetaData verMmd = sm.getClassMetaData().getMetaDataForMember(vermd.getMemberName());
+                    datastoreVersion = sm.provideField(verMmd.getAbsoluteFieldNumber());
                 } else {
                     String versionName = Neo4jSchemaUtils.getSurrogateVersionName(sm.getClassMetaData(), storeMgr);
                     if (node.containsKey(versionName)) {
@@ -156,7 +93,7 @@ public class BoltPersistenceHandler extends AbstractPersistenceHandler {
 
     @Override
     public void updateObject(DNStateManager sm, int[] fieldNumbers) {
-        // Implementation for update
+        // Not implemented
     }
 
     @Override
@@ -167,11 +104,12 @@ public class BoltPersistenceHandler extends AbstractPersistenceHandler {
             Transaction tx = ((BoltConnectionFactoryImpl.EmulatedXAResource) mconn.getXAResource()).getTransaction();
             Node node = BoltPersistenceUtils.getPropertyContainerForStateManager(tx, sm);
 
-            if (node == null) {
-                return;
+            if (node == null) { return; }
+            
+            int[] relPositions = sm.getClassMetaData().getRelationMemberPositions(ec.getClassLoaderResolver());
+            if (relPositions.length > 0) {
+                sm.provideFields(relPositions, new BoltFieldManager(sm, tx, false, node));
             }
-            sm.loadUnloadedFields();
-            sm.provideFields(sm.getClassMetaData().getRelationMemberPositions(ec.getClassLoaderResolver()), new BoltFieldManager(sm, tx, false, node));
             tx.run("MATCH (n) WHERE id(n) = $id DETACH DELETE n", Values.parameters("id", node.id()));
         } finally {
             mconn.release();

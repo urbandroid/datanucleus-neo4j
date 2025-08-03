@@ -24,6 +24,7 @@ import org.datanucleus.ExecutionContext;
 import org.datanucleus.PersistenceNucleusContext;
 import org.datanucleus.PropertyNames;
 import org.datanucleus.exceptions.NucleusException;
+import org.datanucleus.flush.FlushProcess;
 import org.datanucleus.identity.SCOID;
 import org.datanucleus.metadata.AbstractClassMetaData;
 import org.datanucleus.metadata.QueryLanguage;
@@ -189,6 +190,7 @@ public class Neo4jStoreManager extends AbstractStoreManager {
         return super.getClassNameForObjectID(id, clr, ec);
     }
 
+    
     public boolean supportsValueGenerationStrategy(String strategy) {
         if (super.supportsValueGenerationStrategy(strategy)) return true;
         if (strategy.equalsIgnoreCase("IDENTITY")) return true;
